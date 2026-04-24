@@ -1,0 +1,173 @@
+﻿# 本工作流负责在 GitHub 托管的 Windows 环境中测试、构建并发布可执行版本。
+# 选择 Windows runner 是因为项目包含 Windows 管理员权限检测与 UAC 提权代码，
+# 在目标平台上测试可以尽早发现 Windows 专属编译问题。
+name: Build Windows Release
+
+on:
+  # 推送 v 开头的版本标签时自动创建或更新同名 Release。
+  push:
+    tags:
+      - "v*"
+
+  # 允许维护者从 GitHub Actions 页面手动指定版本标签发布。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的版本标签，例如 v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  # 创建 Release 与上传 Release Asset 需要 contents: write。
+  contents: write
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  # APP_NAME 是产物文件名前缀，保持和 cmd 入口目录一致，便于用户识别。
+  APP_NAME: feishu-ai-patcher
+  # CMD_PATH 指向 Go main 包，所有架构构建都复用同一个入口。
+  CMD_PATH: ./cmd/feishu-ai-patcher
+
+jobs:
+  build-and-release:
+    name: Test, Build and Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          # 直接读取 go.mod 中声明的 Go 版本，避免 workflow 与项目配置分叉。
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve release metadata
+        id: meta
+        run: |
+          # 标签触发时使用当前 Git ref；手动触发时使用维护者输入的标签名。
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tagName = "${{ inputs.tag }}"
+          } else {
+            $tagName = "${{ github.ref_name }}"
+          }
+
+          # Release 必须有明确标签，避免误把普通分支构建发布为版本。
+          if ([string]::IsNullOrWhiteSpace($tagName)) {
+            throw "发布标签不能为空。"
+          }
+
+          "tag_name=$tagName" >> $env:GITHUB_OUTPUT
+          "dist_dir=$((Resolve-Path .).Path)\dist" >> $env:GITHUB_OUTPUT
+
+      - name: Run tests
+        run: |
+          # 先输出 Go 版本，便于后续排查 runner 镜像或 go.mod 版本差异。
+          go version
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { throw "go test ./... 执行失败。" }
+
+      - name: Build Windows binaries
+        run: |
+          # dist 保存裸 exe，package 保存每个架构的临时打包目录。
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+
+          # 同时产出常见 x64 与 Windows on Arm 设备可用的版本。
+          $targets = @(
+            @{ Arch = "amd64"; DisplayName = "Windows x64" },
+            @{ Arch = "arm64"; DisplayName = "Windows ARM64" }
+          )
+
+          foreach ($target in $targets) {
+            $env:GOOS = "windows"
+            $env:GOARCH = $target.Arch
+            $env:CGO_ENABLED = "0"
+
+            $exeName = "$env:APP_NAME-windows-$($target.Arch).exe"
+            $exePath = Join-Path "dist" $exeName
+
+            Write-Host "Building $($target.DisplayName): $exePath"
+            go build -trimpath -ldflags "-s -w" -o $exePath $env:CMD_PATH
+            if ($LASTEXITCODE -ne 0) { throw "构建 $($target.DisplayName) 失败。" }
+          }
+
+      - name: Package release assets
+        id: package
+        run: |
+          # 每个 zip 内只放一个可执行文件和一份使用说明，降低用户下载后的选择成本。
+          $architectures = @("amd64", "arm64")
+
+          foreach ($arch in $architectures) {
+            $packageName = "$env:APP_NAME-windows-$arch"
+            $stageDir = Join-Path "package" $packageName
+            $exePath = Join-Path "dist" "$packageName.exe"
+            $zipPath = Join-Path "dist" "$packageName.zip"
+
+            New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+            Copy-Item -LiteralPath $exePath -Destination (Join-Path $stageDir "$env:APP_NAME.exe") -Force
+            Copy-Item -LiteralPath "readme.md" -Destination (Join-Path $stageDir "README.md") -Force
+
+            if (Test-Path -LiteralPath $zipPath) {
+              Remove-Item -LiteralPath $zipPath -Force
+            }
+            Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $zipPath -Force
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          $releaseNotes = @(
+            "自动构建的 Windows 可运行版本。"
+            ""
+            "- ``feishu-ai-patcher-windows-amd64.zip``：适用于常见 Intel/AMD x64 Windows 设备。"
+            "- ``feishu-ai-patcher-windows-arm64.zip``：适用于 Windows on Arm 设备。"
+            ""
+            "使用前请关闭飞书客户端，并在弹出 UAC 时授权管理员权限。"
+          ) -join [Environment]::NewLine
+          Set-Content -LiteralPath $notesPath -Value $releaseNotes -Encoding UTF8
+
+          "notes_path=$notesPath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # 即使 Release 发布失败，也能从本次 Actions 运行页面下载构建包排查问题。
+          name: windows-release-assets
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 使用 GitHub CLI 发布，避免额外引入第三方 release action。
+          # 如果 Release 已存在，则覆盖上传同名资产；如果不存在，则创建新 Release。
+          $tagName = "${{ steps.meta.outputs.tag_name }}"
+          $notesPath = "${{ steps.package.outputs.notes_path }}"
+          $assetPaths = @(Get-ChildItem -LiteralPath "dist" -Filter "*.zip" | ForEach-Object { $_.FullName })
+
+          if ($assetPaths.Count -eq 0) {
+            throw "dist 目录中没有可发布的 zip 资产。"
+          }
+
+          $releaseExists = $false
+          try {
+            gh release view $tagName *> $null
+            $releaseExists = ($LASTEXITCODE -eq 0)
+          } catch {
+            $releaseExists = $false
+          }
+
+          if ($releaseExists) {
+            gh release upload $tagName @assetPaths --clobber
+            if ($LASTEXITCODE -ne 0) { throw "上传 Release 资产失败。" }
+          } else {
+            gh release create $tagName @assetPaths --title $tagName --notes-file $notesPath --target "${{ github.sha }}"
+            if ($LASTEXITCODE -ne 0) { throw "创建 GitHub Release 失败。" }
+          }
+
+

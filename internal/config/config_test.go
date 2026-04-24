@@ -62,6 +62,9 @@ func TestLoadOrCreateFillsMissingFieldsAndNilMaps(t *testing.T) {
 	if cfg.LastSuccessOffsets == nil {
 		t.Fatal("LastSuccessOffsets should be initialized")
 	}
+	if cfg.LastBundleRelativePaths == nil {
+		t.Fatal("LastBundleRelativePaths should be initialized")
+	}
 	if cfg.LastRuleHits == nil {
 		t.Fatal("LastRuleHits should be initialized")
 	}
@@ -76,6 +79,8 @@ func TestSaveWritesJSONReadableByLoadOrCreate(t *testing.T) {
 	cfg.BackupRoot = "custom-backup"
 	cfg.StrictModeDefault = false
 	cfg.LastBundleRelativePath = filepath.Join("app", "webcontent", "messenger-vc", "common", "bundle.js")
+	cfg.LastBundleRelativePaths["knowledge_sidebar"] = "knowledge.js"
+	cfg.LastBundleRelativePaths["group_summary"] = "group.js"
 	cfg.LastSuccessOffsets["frame.dll"] = OffsetCache{
 		OldPatternOffsets: []int64{10, 20},
 		NewPatternOffsets: []int64{30},
@@ -114,12 +119,30 @@ func assertConfigEquals(t *testing.T, got Config, want Config) {
 	if got.LastBundleRelativePath != want.LastBundleRelativePath {
 		t.Fatalf("LastBundleRelativePath = %q, want %q", got.LastBundleRelativePath, want.LastBundleRelativePath)
 	}
+	if !equalStringMap(got.LastBundleRelativePaths, want.LastBundleRelativePaths) {
+		t.Fatalf("LastBundleRelativePaths = %#v, want %#v", got.LastBundleRelativePaths, want.LastBundleRelativePaths)
+	}
 	if !equalOffsetCacheMap(got.LastSuccessOffsets, want.LastSuccessOffsets) {
 		t.Fatalf("LastSuccessOffsets = %#v, want %#v", got.LastSuccessOffsets, want.LastSuccessOffsets)
 	}
 	if !equalRuleHitCacheMap(got.LastRuleHits, want.LastRuleHits) {
 		t.Fatalf("LastRuleHits = %#v, want %#v", got.LastRuleHits, want.LastRuleHits)
 	}
+}
+
+func equalStringMap(a map[string]string, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for key, av := range a {
+		bv, ok := b[key]
+		if !ok || av != bv {
+			return false
+		}
+	}
+
+	return true
 }
 
 func equalOffsetCacheMap(a map[string]OffsetCache, b map[string]OffsetCache) bool {

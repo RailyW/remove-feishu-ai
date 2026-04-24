@@ -67,7 +67,7 @@ type executableLocator func() (string, error)
 // featureTarget 描述一个用户可见功能及其底层组成部分。
 //
 // 当前“侧边栏知识问答”由 `frame.dll` 与知识问答侧边栏 JS 两个底层 patch point
-// 共同构成；“群聊 AI 消息速览/群聊总结”则暂时只包含一条 JS 规则。
+// 共同构成；“群聊 AI 消息速览/群聊总结”由一条支持多 pattern 变体的 JS 规则处理。
 type featureTarget struct {
 	ID          string
 	DisplayName string
@@ -181,7 +181,8 @@ func (a *App) Run(args []string) error {
 // defaultTargets 返回当前版本默认支持的两个用户可见功能目标。
 //
 // 第一个目标“侧边栏知识问答”由 `frame.dll` 与知识问答侧边栏 JS 两个底层组件
-// 共同组成；第二个目标“群聊 AI 消息速览/群聊总结”当前只挂载占位 JS 规则。
+// 共同组成；第二个目标“群聊 AI 消息速览/群聊总结”挂载群聊总结 JS 规则，
+// 该规则内部可按优先级尝试多个 exact pattern 变体以兼容不同飞书版本。
 func defaultTargets() []featureTarget {
 	return []featureTarget{
 		{
@@ -351,12 +352,14 @@ func (a *App) detectComponent(ctx context.Context, env *Env, component feature.F
 		}
 		return state, nil
 	case *featurejs.Feature:
-		state, meta, err := concrete.DetectWithCache(ctx, env, env.Config.LastBundleRelativePath)
+		cachedRelativePath := jsBundleCachePath(env.Config, concrete.ID())
+		state, meta, err := concrete.DetectWithCache(ctx, env, cachedRelativePath)
 		if err != nil {
 			return feature.State{}, err
 		}
 		if meta.RelativePath != "" {
 			env.Config.LastBundleRelativePath = meta.RelativePath
+			env.Config.LastBundleRelativePaths[concrete.ID()] = meta.RelativePath
 			if info, statErr := os.Stat(meta.BundlePath); statErr == nil {
 				env.Config.LastRuleHits[concrete.ID()] = config.RuleHitCache{
 					FileSize: info.Size(),
@@ -368,6 +371,22 @@ func (a *App) detectComponent(ctx context.Context, env *Env, component feature.F
 	default:
 		return component.Detect(ctx, env)
 	}
+}
+
+// jsBundleCachePath 返回指定 JS 规则可使用的缓存相对路径。
+//
+// 新配置按规则 ID 保存 bundle 路径，避免多个 JS 功能互相污染缓存；旧版本配置只
+// 有 LastBundleRelativePath 单值，为了兼容已存在的配置文件，这里会在规则专属缓存
+// 缺失时回退到旧字段。featurejs 内部仍会重新校验 marker，因此旧字段只做加速，
+// 不会强行决定最终命中文件。
+func jsBundleCachePath(cfg config.Config, ruleID string) string {
+	if cfg.LastBundleRelativePaths != nil {
+		if cachedRelativePath := cfg.LastBundleRelativePaths[ruleID]; cachedRelativePath != "" {
+			return cachedRelativePath
+		}
+	}
+
+	return cfg.LastBundleRelativePath
 }
 
 // aggregateStates 将一个用户可见功能的多个底层组件状态合成为一个菜单状态。
@@ -777,6 +796,9 @@ func (a *App) persistConfig(env *Env) error {
 func ensureConfigMaps(cfg *config.Config) {
 	if cfg.LastSuccessOffsets == nil {
 		cfg.LastSuccessOffsets = make(map[string]config.OffsetCache)
+	}
+	if cfg.LastBundleRelativePaths == nil {
+		cfg.LastBundleRelativePaths = make(map[string]string)
 	}
 	if cfg.LastRuleHits == nil {
 		cfg.LastRuleHits = make(map[string]config.RuleHitCache)

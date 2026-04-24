@@ -30,14 +30,17 @@ const (
 // LastSuccessOffsets 缓存二进制替换在文件中的历史命中偏移，后续 frame.dll
 // 处理可基于文件大小和修改时间判断缓存是否仍可复用。
 // LastBundleRelativePath 保存上一次成功处理的 JS bundle 相对路径。
+// LastBundleRelativePaths 保存每个 JS 规则上一次成功命中的 bundle 相对路径，用于
+// 避免“知识问答”和“群聊总结”等不同规则互相复用同一个过期缓存路径。
 // LastRuleHits 缓存规则命中文件的元信息，供后续快速判断文件是否变化。
 type Config struct {
-	LastInstallPath        string                  `json:"last_install_path"`
-	BackupRoot             string                  `json:"backup_root"`
-	StrictModeDefault      bool                    `json:"strict_mode_default"`
-	LastSuccessOffsets     map[string]OffsetCache  `json:"last_success_offsets,omitempty"`
-	LastBundleRelativePath string                  `json:"last_bundle_relative_path,omitempty"`
-	LastRuleHits           map[string]RuleHitCache `json:"last_rule_hits,omitempty"`
+	LastInstallPath         string                  `json:"last_install_path"`
+	BackupRoot              string                  `json:"backup_root"`
+	StrictModeDefault       bool                    `json:"strict_mode_default"`
+	LastSuccessOffsets      map[string]OffsetCache  `json:"last_success_offsets,omitempty"`
+	LastBundleRelativePath  string                  `json:"last_bundle_relative_path,omitempty"`
+	LastBundleRelativePaths map[string]string       `json:"last_bundle_relative_paths,omitempty"`
+	LastRuleHits            map[string]RuleHitCache `json:"last_rule_hits,omitempty"`
 }
 
 // OffsetCache 描述一个目标文件中已成功匹配的字节偏移缓存。
@@ -66,11 +69,12 @@ type RuleHitCache struct {
 // 不需要额外判断 nil。
 func Default() Config {
 	return Config{
-		LastInstallPath:    defaultLastInstallPath,
-		BackupRoot:         defaultBackupRoot,
-		StrictModeDefault:  true,
-		LastSuccessOffsets: make(map[string]OffsetCache),
-		LastRuleHits:       make(map[string]RuleHitCache),
+		LastInstallPath:         defaultLastInstallPath,
+		BackupRoot:              defaultBackupRoot,
+		StrictModeDefault:       true,
+		LastSuccessOffsets:      make(map[string]OffsetCache),
+		LastBundleRelativePaths: make(map[string]string),
+		LastRuleHits:            make(map[string]RuleHitCache),
 	}
 }
 
@@ -136,6 +140,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.LastSuccessOffsets == nil {
 		cfg.LastSuccessOffsets = make(map[string]OffsetCache)
+	}
+	if cfg.LastBundleRelativePaths == nil {
+		cfg.LastBundleRelativePaths = make(map[string]string)
 	}
 	if cfg.LastRuleHits == nil {
 		cfg.LastRuleHits = make(map[string]RuleHitCache)

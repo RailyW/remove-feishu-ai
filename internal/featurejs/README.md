@@ -17,10 +17,11 @@
 
 定义本模块的规则与功能对象：
 
-- `Rule`：描述功能 ID、显示名称、bundle 目录、marker 集合、原始/补丁 pattern 和期望命中数。
+- `Rule`：描述功能 ID、显示名称、bundle 目录、marker 集合、原始/补丁 pattern 与可选 pattern 变体。
+- `PatternVariant`：描述同一功能在不同飞书版本或不同压缩布局下的一组可恢复 exact pattern。
 - `Feature`：持有单条 `Rule`，并实现 `feature.Feature` 所需的基础接口。
 - `DefaultKnowledgeSidebarRule()`：返回“知识库 AI”当前已知的稳定规则。
-- `DefaultGroupSummaryRule()`：返回“群聊总结”的占位规则；由于尚无稳定规则，当前设计就是安全返回 `unknown`。
+- `DefaultGroupSummaryRule()`：返回“群聊 AI 消息速览/群聊总结”规则，通过 `my-ai-summarize-button`、`summarizeButtonEnable` 和 `onSummarizeButtonClick` 等 marker 定位新消息提示里的 My AI 总结入口。
 
 ### [`patch.go`](./patch.go)
 
@@ -61,6 +62,7 @@
 
 - `Detect()` 与 `DetectWithCache()`：对外提供按安装根目录执行的检测入口。
 - `detect()`：串联定位与 pattern 计数，构造 `DetectMeta`。
+- `detectPatternVariant()`：按优先级检测多个 `PatternVariant`，用于兼容不同飞书版本中压缩变量名或渲染结构的变化。
 - `classify()`：根据每个 exact pattern 的单独命中结果给出最终状态。
 - `patternHits()`：按字符串 pattern 分别统计命中次数，避免“单个 pattern 重复两次但另一个缺失”被误判成明确状态。
 
@@ -73,8 +75,8 @@
 - 知识库 AI 的 `original` / `patched` / `mixed` 判定，以及单个 original pattern 重复多次时必须返回 `unknown`。
 - 知识库 AI `Remove` / `Restore` 的成功路径、备份失败不写入，以及 `mixed` / `unknown` 拒绝写入。
 - 单个 original pattern 重复多次且另一个缺失时，`Remove` 返回 `ErrJSActionNotAllowed` 且不会调用备份。
-- 群聊总结占位规则在当前无法定位稳定 bundle 时拒绝 `Remove` / `Restore`。
-- 群聊总结在当前无稳定规则时安全返回 `unknown`。
+- 群聊总结规则能识别原始、已补丁和混合状态，并能在主渲染门控缺失时使用备用状态门控变体。
+- 群聊总结 `Remove` / `Restore` 使用检测时命中的同一变体执行成对替换，保证备用规则也可恢复。
 - 未找到候选 bundle 时返回 `unknown`，而不是误报或写入。
 
 ## 关键约束
@@ -127,6 +129,18 @@
 - `mixed`、`unknown`、未找到 bundle、部分 original/patched pattern 命中都返回 `ErrJSActionNotAllowed`，且不会调用 `tx.BackupFile`。
 - 写入前调用 `tx.BackupFile(relativePathFromInstallRoot, targetPath)`，其中 `relativePathFromInstallRoot` 形如 `app\webcontent\messenger-vc\common\a1.js`。
 - 写后重新检测，状态没有切换到目标状态时返回 `ErrJSVerifyFailed`。
+
+### 群聊总结的多版本兼容策略
+
+“群聊 AI 消息速览/群聊总结”目前定位到飞书新消息提示中的 My AI 总结按钮。规则不依赖固定哈希文件名，而是要求候选 bundle 同时命中：
+
+- `my-ai-summarize-button`
+- `summarizeButtonEnable`
+- `onSummarizeButtonClick`
+
+写入时优先使用按钮渲染门控变体，把创建 `my-ai-summarize-button` 组件前的条件改为恒 false；如果该片段因版本变化不存在，会回退到 `summarizeButtonEnable` 状态门控变体，把初始状态改为 `Boolean(!1)`。
+
+多变体检测遵循保守优先级：只要高优先级变体出现任何原始或补丁片段，即使数量不足导致状态为 `unknown`，也不会继续尝试低优先级变体，以免在半修改文件上错误继续写入。只有当前变体完全没有命中时，才会尝试备用变体。
 
 ### Windows 替换安全性
 

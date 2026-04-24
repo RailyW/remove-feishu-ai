@@ -16,6 +16,8 @@ import (
 // OriginalPatternHits / PatchedPatternHits 分别记录每个 exact pattern 的单独命中次数。
 // OriginalCount / PatchedCount 是上述命中切片的总和，便于 mixed/unknown 等聚合判断。
 // LocateMode 标记本次使用缓存路径命中还是目录扫描命中。
+// PatternVariantName / PatternVariantIndex 标记最终采用的规则变体，供写入阶段按
+// 同一组 exact pattern 执行 Remove 或 Restore。
 type DetectMeta struct {
 	BundlePath          string
 	RelativePath        string
@@ -25,6 +27,8 @@ type DetectMeta struct {
 	OriginalCount       int
 	PatchedCount        int
 	LocateMode          string
+	PatternVariantName  string
+	PatternVariantIndex int
 }
 
 // Detect 根据安装根目录定位 bundle 目录，并执行无写入状态检测。
@@ -74,21 +78,49 @@ func (f *Feature) detect(commonDir string, cachedRelativePath string) (feature.S
 	if err != nil {
 		return feature.State{Internal: feature.StateUnknown}, DetectMeta{}, err
 	}
-	originalPatternHits := patternHits(string(content), f.rule.OriginalPatterns)
-	patchedPatternHits := patternHits(string(content), f.rule.PatchedPatterns)
-
-	meta := DetectMeta{
-		BundlePath:          candidate.Path,
-		RelativePath:        candidate.RelativePath,
-		Score:               candidate.Score,
-		OriginalPatternHits: originalPatternHits,
-		PatchedPatternHits:  patchedPatternHits,
-		OriginalCount:       countPatternHits(originalPatternHits),
-		PatchedCount:        countPatternHits(patchedPatternHits),
-		LocateMode:          locateMode,
-	}
+	meta := f.detectPatternVariant(string(content))
+	meta.BundlePath = candidate.Path
+	meta.RelativePath = candidate.RelativePath
+	meta.Score = candidate.Score
+	meta.LocateMode = locateMode
 
 	return f.classify(meta), meta, nil
+}
+
+// detectPatternVariant 按规则声明顺序检测当前 bundle 命中的 exact pattern 变体。
+//
+// 同一功能可能在不同飞书版本中出现不同压缩变量名或渲染结构，因此 Rule 允许声明
+// 多个 PatternVariant。这里的选择策略是“优先级 + 保守停止”：
+//  1. 如果某个变体能明确归类为 original、patched 或 mixed，立即采用该变体。
+//  2. 如果某个变体出现任何 original/patched 片段但数量不足以归类，也立即采用该
+//     unknown 结果，避免跳到备用变体后在部分修改文件上继续写入。
+//  3. 只有当前变体完全没有命中任何片段时，才继续尝试低优先级变体。
+//  4. 所有变体都没有命中时，返回第一变体的零命中结果，供上层展示 unknown。
+func (f *Feature) detectPatternVariant(content string) DetectMeta {
+	variants := f.patternVariants()
+	var firstMeta DetectMeta
+	for index, variant := range variants {
+		originalPatternHits := patternHits(content, variant.OriginalPatterns)
+		patchedPatternHits := patternHits(content, variant.PatchedPatterns)
+		meta := DetectMeta{
+			OriginalPatternHits: originalPatternHits,
+			PatchedPatternHits:  patchedPatternHits,
+			OriginalCount:       countPatternHits(originalPatternHits),
+			PatchedCount:        countPatternHits(patchedPatternHits),
+			PatternVariantName:  variant.Name,
+			PatternVariantIndex: index,
+		}
+		if index == 0 {
+			firstMeta = meta
+		}
+
+		state := f.classify(meta).Normalized().Internal
+		if state != feature.StateUnknown || meta.OriginalCount > 0 || meta.PatchedCount > 0 {
+			return meta
+		}
+	}
+
+	return firstMeta
 }
 
 // classify 根据每个 exact pattern 的单独命中结果归类 bundle 当前状态。

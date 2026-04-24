@@ -316,39 +316,99 @@ func TestKnowledgeSidebarRemoveRejectsRepeatedSingleOriginalPatternWithoutBackup
 	tx.assertNoBackup(t)
 }
 
-func TestGroupSummaryRemoveRestoreRejectPlaceholderRuleWithoutBackup(t *testing.T) {
-	installRoot, commonDir := makeInstalledCommonDir(t)
-	writeJSFile(t, commonDir, "a1.js", knowledgeSidebarJS(originalPatterns()))
-
-	featureUnderTest := NewGroupSummaryFeature()
+func TestGroupSummaryDetectClassifiesOriginalPatchedAndMixed(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		action func(context.Context, feature.Env, feature.Tx) error
+		name     string
+		patterns []string
+		want     feature.InternalState
 	}{
-		{name: "remove", action: featureUnderTest.Remove},
-		{name: "restore", action: featureUnderTest.Restore},
+		{name: "original", patterns: groupSummaryOriginalPatterns(), want: feature.StateOriginal},
+		{name: "patched", patterns: groupSummaryPatchedPatterns(), want: feature.StatePatched},
+		{name: "mixed", patterns: append(groupSummaryOriginalPatterns(), groupSummaryPatchedPatterns()...), want: feature.StateMixed},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			tx := &fakeTx{t: t}
-			err := test.action(context.Background(), fakeEnv{installPath: installRoot}, tx)
-			if !errors.Is(err, ErrJSActionNotAllowed) {
-				t.Fatalf("%s error = %v, want ErrJSActionNotAllowed", test.name, err)
+			commonDir := makeCommonDir(t)
+			writeJSFile(t, commonDir, "group-summary.js", groupSummaryJS(test.patterns))
+
+			state, meta, err := NewGroupSummaryFeature().detect(commonDir, "")
+			if err != nil {
+				t.Fatalf("detect returned error: %v", err)
 			}
-			tx.assertNoBackup(t)
+
+			assertJSState(t, state, test.want)
+			if meta.RelativePath != "group-summary.js" {
+				t.Fatalf("RelativePath = %q, want %q", meta.RelativePath, "group-summary.js")
+			}
 		})
 	}
 }
 
-func TestGroupSummaryDetectReturnsUnknownWithPlaceholderRule(t *testing.T) {
-	commonDir := makeCommonDir(t)
-	writeJSFile(t, commonDir, "c3.js", knowledgeSidebarJS(originalPatterns()))
+func TestGroupSummaryRemoveRestorePatchesSummarizeButtonRenderGate(t *testing.T) {
+	installRoot, commonDir := makeInstalledCommonDir(t)
+	targetPath := writeJSFile(t, commonDir, "group-summary.js", groupSummaryJS(groupSummaryOriginalPatterns()))
+	tx := &fakeTx{
+		t:                t,
+		wantRelativePath: filepath.Join(DefaultGroupSummaryRule().BundleDir, "group-summary.js"),
+		wantSourcePath:   targetPath,
+	}
+	featureUnderTest := NewGroupSummaryFeature()
 
-	state, _, err := NewGroupSummaryFeature().detect(commonDir, "")
+	if err := featureUnderTest.Remove(context.Background(), fakeEnv{installPath: installRoot}, tx); err != nil {
+		t.Fatalf("Remove returned error: %v", err)
+	}
+	tx.assertBackupCalledOnce(t)
+	assertGroupSummaryBundleContentState(t, targetPath, feature.StatePatched)
+
+	if err := featureUnderTest.Restore(context.Background(), fakeEnv{installPath: installRoot}, tx); err != nil {
+		t.Fatalf("Restore returned error: %v", err)
+	}
+	assertGroupSummaryBundleContentState(t, targetPath, feature.StateOriginal)
+}
+
+func TestGroupSummaryRemoveRestoreUsesStateGateFallbackWhenRenderGateAlreadyPatched(t *testing.T) {
+	installRoot, commonDir := makeInstalledCommonDir(t)
+	targetPath := writeJSFile(t, commonDir, "group-summary.js", groupSummaryJS(groupSummaryFallbackOriginalPatterns()))
+	tx := &fakeTx{
+		t:                t,
+		wantRelativePath: filepath.Join(DefaultGroupSummaryRule().BundleDir, "group-summary.js"),
+		wantSourcePath:   targetPath,
+	}
+	featureUnderTest := NewGroupSummaryFeature()
+
+	state, meta, err := featureUnderTest.detect(commonDir, "")
+	if err != nil {
+		t.Fatalf("detect returned error: %v", err)
+	}
+	assertJSState(t, state, feature.StateOriginal)
+	if meta.PatternVariantName != "state_gate" {
+		t.Fatalf("PatternVariantName = %q, want %q", meta.PatternVariantName, "state_gate")
+	}
+
+	if err := featureUnderTest.Remove(context.Background(), fakeEnv{installPath: installRoot}, tx); err != nil {
+		t.Fatalf("Remove returned error: %v", err)
+	}
+	tx.assertBackupCalledOnce(t)
+	assertGroupSummaryBundleContentState(t, targetPath, feature.StatePatched)
+
+	if err := featureUnderTest.Restore(context.Background(), fakeEnv{installPath: installRoot}, tx); err != nil {
+		t.Fatalf("Restore returned error: %v", err)
+	}
+	assertGroupSummaryBundleContentState(t, targetPath, feature.StateOriginal)
+}
+
+func TestGroupSummaryDetectIgnoresKnowledgeSidebarOnlyBundle(t *testing.T) {
+	commonDir := makeCommonDir(t)
+	writeJSFile(t, commonDir, "knowledge.js", knowledgeSidebarJS(originalPatterns()))
+
+	state, meta, err := NewGroupSummaryFeature().detect(commonDir, "")
 	if err != nil {
 		t.Fatalf("detect returned error: %v", err)
 	}
 
 	assertJSState(t, state, feature.StateUnknown)
+	if meta.BundlePath != "" || meta.RelativePath != "" || meta.Score != 0 || meta.OriginalCount != 0 || meta.PatchedCount != 0 {
+		t.Fatalf("meta = %#v, want zero-value fields when only knowledge-sidebar bundle exists", meta)
+	}
 }
 
 func TestDetectReturnsUnknownWhenNoCandidateBundleFound(t *testing.T) {
@@ -478,6 +538,62 @@ func patchedPatterns() []string {
 	}
 }
 
+// groupSummaryJS 构造“群聊 AI 消息速览/群聊总结”测试用最小 bundle。
+//
+// 该内容只保留定位所需的稳定 marker，以及状态检测所需的原始或补丁片段，
+// 避免测试依赖真实飞书安装目录中的大体积压缩 bundle。
+func groupSummaryJS(patterns []string) string {
+	content := "my-ai-summarize-button;\n"
+	content += "summarizeButtonEnable;\n"
+	content += "onSummarizeButtonClick;\n"
+	for _, pattern := range patterns {
+		content += pattern + ";\n"
+	}
+
+	return content
+}
+
+// groupSummaryOriginalPatterns 返回当前已知版本中“消息速览”按钮渲染入口的原始片段。
+//
+// 该片段围绕 `my-ai-summarize-button` 的渲染门控，命中后将其替换为恒 false
+// 门控即可隐藏新消息提示中的 My AI 总结按钮。
+func groupSummaryOriginalPatterns() []string {
+	return []string{
+		`u&&h&&p&&c().createElement(GZt,{className:"my-ai-summarize-button",direction:o,onSummarizeButtonClick:h,channelType:p})`,
+	}
+}
+
+// groupSummaryPatchedPatterns 返回与 groupSummaryOriginalPatterns 一一对应的补丁片段。
+//
+// 这里保留原有参数和组件调用结构，只把最前面的渲染条件改为恒 false，
+// 便于 Restore 精确恢复，也降低对周边压缩代码布局的影响。
+func groupSummaryPatchedPatterns() []string {
+	return []string{
+		`!1&&h&&p&&c().createElement(GZt,{className:"my-ai-summarize-button",direction:o,onSummarizeButtonClick:h,channelType:p})`,
+	}
+}
+
+// groupSummaryFallbackOriginalPatterns 返回群聊总结备用规则的原始片段。
+//
+// 该片段来自消息列表初始化状态中的 summarizeButtonEnable 计算。当渲染门控片段因
+// 版本差异不存在时，工具仍可通过该状态门控隐藏按钮；当前真实安装目录中也能命中
+// 该片段，因此它用于覆盖跨版本兼容路径。
+func groupSummaryFallbackOriginalPatterns() []string {
+	return []string{
+		`summarizeButtonEnable:Boolean(a&&(0,Pu.Wx)(a)&&!(0,Vg.Y)()&&a.getNewMessageCount&&a.getNewMessageCount()>=10)`,
+	}
+}
+
+// groupSummaryFallbackPatchedPatterns 返回群聊总结备用规则的补丁片段。
+//
+// 使用 `Boolean(!1)` 而不是裸 `!1`，可以保持原始字段值表达式仍是显式布尔化调用，
+// 便于 exact restore 并减少对压缩代码周边语法的影响。
+func groupSummaryFallbackPatchedPatterns() []string {
+	return []string{
+		`summarizeButtonEnable:Boolean(!1)`,
+	}
+}
+
 func repeatedText(text string, count int) string {
 	result := ""
 	for i := 0; i < count; i++ {
@@ -506,5 +622,19 @@ func assertBundleContentState(t *testing.T, path string, want feature.InternalSt
 		PatchedCount:        countPatternHits(patternHits(content, patchedPatterns())),
 	}
 	state := NewKnowledgeSidebarFeature().classify(meta)
+	assertJSState(t, state, want)
+}
+
+// assertGroupSummaryBundleContentState 按群聊总结规则检查测试 bundle 的写入结果。
+//
+// 该断言复用生产代码的 classify 逻辑，确保测试验证的是规则可观察状态，
+// 而不是仅仅检查某个字符串是否被替换。
+func assertGroupSummaryBundleContentState(t *testing.T, path string, want feature.InternalState) {
+	t.Helper()
+
+	content := readTextFile(t, path)
+	featureUnderTest := NewGroupSummaryFeature()
+	meta := featureUnderTest.detectPatternVariant(content)
+	state := featureUnderTest.classify(meta)
 	assertJSState(t, state, want)
 }

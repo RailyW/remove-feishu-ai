@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"remove-feishu-ai/internal/cli"
+	"remove-feishu-ai/internal/config"
 	"remove-feishu-ai/internal/feature"
 )
 
@@ -104,6 +105,24 @@ func TestAggregateStatesForCompositeFeature(t *testing.T) {
 				t.Fatalf("aggregateStates() = %q, want %q", got.Internal, test.want)
 			}
 		})
+	}
+}
+
+func TestJSBundleCachePathPrefersRuleSpecificCache(t *testing.T) {
+	cfg := testConfigWithBundleCaches()
+
+	got := jsBundleCachePath(cfg, "group_summary")
+	if got != "group.js" {
+		t.Fatalf("jsBundleCachePath() = %q, want %q", got, "group.js")
+	}
+}
+
+func TestJSBundleCachePathFallsBackToLegacySingleCache(t *testing.T) {
+	cfg := testConfigWithBundleCaches()
+
+	got := jsBundleCachePath(cfg, "missing_rule")
+	if got != "legacy.js" {
+		t.Fatalf("jsBundleCachePath() = %q, want %q", got, "legacy.js")
 	}
 }
 
@@ -224,6 +243,16 @@ func findMenuItem(t *testing.T, items []cli.MenuItem, action cli.Action) cli.Men
 
 	t.Fatalf("menu item %q not found", action)
 	return cli.MenuItem{}
+}
+
+func testConfigWithBundleCaches() config.Config {
+	return config.Config{
+		LastBundleRelativePath: "legacy.js",
+		LastBundleRelativePaths: map[string]string{
+			"knowledge_sidebar": "knowledge.js",
+			"group_summary":     "group.js",
+		},
+	}
 }
 
 type fakeFeatureComponent struct {

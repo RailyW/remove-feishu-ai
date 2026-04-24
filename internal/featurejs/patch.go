@@ -36,8 +36,6 @@ func (f *Feature) Remove(ctx context.Context, env feature.Env, tx feature.Tx) er
 		tx,
 		feature.StateOriginal,
 		feature.StatePatched,
-		f.rule.OriginalPatterns,
-		f.rule.PatchedPatterns,
 		"remove",
 	)
 }
@@ -53,8 +51,6 @@ func (f *Feature) Restore(ctx context.Context, env feature.Env, tx feature.Tx) e
 		tx,
 		feature.StatePatched,
 		feature.StateOriginal,
-		f.rule.PatchedPatterns,
-		f.rule.OriginalPatterns,
 		"restore",
 	)
 }
@@ -62,23 +58,19 @@ func (f *Feature) Restore(ctx context.Context, env feature.Env, tx feature.Tx) e
 // patch 执行一次受保护的 JS bundle 全文件替换。
 //
 // allowedState 是写入前必须满足的状态，targetState 是写入后必须重检达到的状态。
-// fromPatterns 与 toPatterns 必须一一对应，函数会读取目标 bundle 到内存后执行成对
-// ReplaceAll，并通过临时文件替换原文件来减少半写入风险。
+// 函数会读取 detect 阶段命中的 PatternVariant，按动作方向取出一一对应的
+// fromPatterns / toPatterns，再读取目标 bundle 到内存后执行成对 ReplaceAll，并通过
+// 临时文件替换原文件来减少半写入风险。
 func (f *Feature) patch(
 	ctx context.Context,
 	env feature.Env,
 	tx feature.Tx,
 	allowedState feature.InternalState,
 	targetState feature.InternalState,
-	fromPatterns []string,
-	toPatterns []string,
 	action string,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-	if len(fromPatterns) != len(toPatterns) {
-		return fmt.Errorf("%w: %s pattern pair count mismatch", ErrJSVerifyFailed, action)
 	}
 
 	commonDir := filepath.Join(env.InstallPath(), f.rule.BundleDir)
@@ -89,6 +81,10 @@ func (f *Feature) patch(
 	normalizedState := state.Normalized().Internal
 	if normalizedState != allowedState || meta.BundlePath == "" {
 		return fmt.Errorf("%w: %s requires %s state, got %s", ErrJSActionNotAllowed, action, allowedState, normalizedState)
+	}
+	fromPatterns, toPatterns, err := f.patchPatternsFor(meta.PatternVariantIndex, allowedState)
+	if err != nil {
+		return fmt.Errorf("%w: %s %v", ErrJSVerifyFailed, action, err)
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -122,6 +118,32 @@ func (f *Feature) patch(
 	}
 
 	return nil
+}
+
+// patchPatternsFor 根据检测命中的变体和动作方向返回需要替换的一组 pattern。
+//
+// Remove 方向要求当前状态为 original，因此把该变体的 OriginalPatterns 替换为
+// PatchedPatterns；Restore 方向相反。函数会校验变体下标和成对 pattern 数量，
+// 避免规则配置不完整时写出不可恢复内容。
+func (f *Feature) patchPatternsFor(variantIndex int, allowedState feature.InternalState) ([]string, []string, error) {
+	variants := f.patternVariants()
+	if variantIndex < 0 || variantIndex >= len(variants) {
+		return nil, nil, fmt.Errorf("pattern variant index %d out of range", variantIndex)
+	}
+
+	variant := variants[variantIndex]
+	if len(variant.OriginalPatterns) != len(variant.PatchedPatterns) {
+		return nil, nil, fmt.Errorf("pattern pair count mismatch in variant %q", variant.Name)
+	}
+
+	switch allowedState {
+	case feature.StateOriginal:
+		return variant.OriginalPatterns, variant.PatchedPatterns, nil
+	case feature.StatePatched:
+		return variant.PatchedPatterns, variant.OriginalPatterns, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported allowed state %s", allowedState)
+	}
 }
 
 // replacePatternPairs 将 fromPatterns 中的每个 pattern 按相同下标替换为 toPatterns。
